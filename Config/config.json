@@ -1,0 +1,32 @@
+{
+    "app_name": "ALPR",
+    "version": "1.0.0",
+    "settings": {
+        "language": "en"
+    },
+    "audio": "ON",
+    "selected_audio_file": "Resources/audio/track1.wav",
+    "ffmpeg_lib_path": "ffmpeg-7.1-full_build/ffmpeg-7.1-full_build/bin/ffmpeg.exe",
+    "database": {
+        "server": "ITDT14",
+        "dsn": "ALPR_DB_DSN",
+        "user": "sa",
+        "password": "root1234",
+        "db_name": "PPE_DB_NEW"
+    },
+    "model_details": {
+        "license_plate_detection_model_path": "engine/bigger.pt"
+    },
+    "ocr_details": {
+        "lang": "en",
+        "use_angle_cls": true
+    },
+    "log_file_path": "logs\\testinglog.log",
+    "tables": {
+        "event_details": {
+            "table_name": "[dbo].[event_details]"
+        }
+    },
+    "log_level": "info",
+    "log_type": "low"
+}

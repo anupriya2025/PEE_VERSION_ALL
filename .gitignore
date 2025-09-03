@@ -1,0 +1,16 @@
+# Ignore IDE settings
+.idea/
+.vscode/
+resourse/
+# Ignore virtual environment folders
+venv/
+env/
+
+# Ignore build or output folders
+build/
+dist/
+resource/
+
+# Ignore temp runner file
+tempCodeRunnerFile.py
+__pycache__/
