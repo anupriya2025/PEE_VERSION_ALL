@@ -1,24 +1,25 @@
 from flask import Flask, jsonify
-from core.database import EventDatabase
 
-def create_api(db_path="./resource/events_new.db"):
+
+def create_api(db_path="./resource/events.db", obj_db=None):
     app = Flask(__name__)
-    db = EventDatabase(db_path)
+    db = obj_db
 
     @app.route("/latest-event", methods=["GET"])
     def get_latest_event():
         db.cursor.execute("""
-            SELECT  ID, camera_name, image_base64
-            FROM events_new
+            SELECT timestamp, event_id, camera_name, image_base64
+            FROM events
             ORDER BY id DESC
             LIMIT 1
         """)
         row = db.cursor.fetchone()
         if row:
             return jsonify({
-                "event_id": row[0],
-                "camera_name": row[1],
-                "image_base64": row[2]
+                "timestamp": row[0],
+                "event_id": row[1],
+                "camera_name": row[2],
+                "image_base64": row[3]
             })
         return jsonify({"message": "No events found"}), 404
 
@@ -26,7 +27,7 @@ def create_api(db_path="./resource/events_new.db"):
     def get_last_n_events(count):
         db.cursor.execute(f"""
                SELECT timestamp, event_id, camera_name, image_base64
-               FROM events_new
+               FROM events
                ORDER BY id DESC
                LIMIT ?
            """, (count,))

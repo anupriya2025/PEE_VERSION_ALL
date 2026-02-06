@@ -1,4 +1,10 @@
 import base64
+from datetime import datetime
+import json
+import glob
+import json
+import math
+import random
 import threading
 import cv2
 import time
@@ -6,864 +12,1636 @@ import os
 import torch
 import numpy as np
 from ultralytics import YOLO
-from core.database import EventDatabase
-from collections import defaultdict
+from config import ConfigLoader
+from collections import OrderedDict, defaultdict, deque
+from core.video_handler import start_daemon_thread
 from threading import Lock, Event
 import queue
 from torch.cuda.amp import autocast
-from share_queue import frame_queue_to_show,show_queue
+from share_queue import  pid_last_seen,inactive_ids_record, post_buffer_frames
 from core.sort1 import Sort
+from core.video_rec import VideoCreator
 import concurrent.futures
 from functools import lru_cache
-
+import gc
+import weakref
 import share_queue
-
-os.makedirs("person_crops", exist_ok=True)
+import glob
+import json
+import cv2
+import os
+import time
+import numpy as np
+from collections import defaultdict, Counter
+import threading
+from core.common_list_for_video import frame_list
+from  logger import LoggerUtility
 
 class FrameProcessor:
-    def __init__(self, frame_queue, person_crop_queue):
+    def __init__(self, frame_queue,obj_db,frame_lock=None):
         try:
             self.frame_queue = frame_queue
-            self.person_crop_queue = person_crop_queue
+            self.camera_roi_map={}
+            self.frame_lock= frame_lock
+            self.event_id_records={}
+            self.time_stamp_track_id_records = {}
+            prev_id=0
+            self.id_wise_frame_count=defaultdict(int)   # person_id -> count
+            self.cfg = ConfigLoader()
+            self.db =obj_db
+            self.prev_id= prev_id + 1
             self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-            self.frame_queue_to_store_detection= queue.Queue(maxsize=100)
+            self.maxsize=int(self.cfg.get("MAIN.max_queue_size","100"))
+            self.person_model = YOLO("yolo11m.pt")
+            self.base_folder = self.db.get_image_path()
             
-            # Initialize SORT tracker with optimized parameters
-            self.sort_tracker = Sort(
-                max_age=30,
-                min_hits=4,
-                iou_threshold=0.3
-            )
-            # show_queues[cam_id] = Queue(maxsize=50)
-            
-            # Optimized thread management
-            self._load_and_optimize_models()
-            self.detection_executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=8,  # Increased for better parallel processing
-                thread_name_prefix="detection"
-            )
-            self.detection_thread_lock = Lock()
-            self.active_detection_threads = 0
-            self.max_detection_threads = 8  # Increased from 5
-            det_thread= threading.Thread(target=self.detection_process, daemon=True)
-            det_thread.start()
-            
+            self.person_video_frame_count = defaultdict(int)
+            self.person_video_lock = Lock()
+            self.MAX_VIDEO_FRAMES_PER_PERSON =int(self.cfg.get("RECORDING.recording_max_frames_per_pid","100"))
 
+            self.video_frame_count = defaultdict(int)   # person_id -> count
+            self.video_frame_lock = Lock()
+            MAX_VIDEO_FRAMES = int(self.cfg.get("RECORDING.recording_max_frames_per_pid","100"))
             
-            # Load and optimize models
-            # self._load_and_optimize_models()
+            self.status_bank = {}
+            self.event_queue = queue.Queue(maxsize=self.maxsize)
+            self.store_frame = {}
+            self.lock= threading.Lock()
+            obj_logger=LoggerUtility()
+            self.logger=obj_logger.get_logger(__name__)
+            self.event_triggered = {}
+            self.last_inserted_status = defaultdict(list)
+            # Single model for detection
+            path=self.cfg.get("MODEL.helmet_model_path")
+            self.head_helmet_model = YOLO(path)
+            # self.head_model = YOLO(path)
+            if self.device=="cuda":
+                self.head_helmet_model.fuse()
+                self.head_helmet_model.to('cuda')
+                self.head_helmet_model.half()
+                
+                self.person_model.fuse()
+                self.person_model.to('cuda')
+                self.person_model.half()
+            self.recording_data = {}
+            self.store_video = queue.Queue(maxsize=100)
+
+            # buffer_len = int(self.cfg.get("DETECTION.buffer_frames", "300"))  # default ~300 frames
+            # self.frame_buffers = defaultdict(lambda: deque(maxlen=buffer_len))
+
+            # Camera-specific SORT trackers for better tracking per camera
+            self.camera_trackers = {}
+            self.tracker_lock = threading.Lock()
             
-            self.db = EventDatabase()
-            self.all_events = set()
-            
-            # SORT-specific tracking settings
-            self.track_id_mapping = {}
-            self.custom_id_counter = 1
-            self.track_history = {}
-            self.lost_tracks = {}
-            
-            # Optimized caching with TTL
-            self.detection_cache = {}
-            self.cache_ttl = {}
-            self.cache_duration = 0.3  # Reduced for better accuracy
-            
-            # Performance settings
-            self.target_size = (640, 480)
-            self.min_box_size = 30
             self.running = True
             
+            # Database and event tracking
+            
+            
+            # Camera-specific threads and queues
+            self.camera_threads = {}
+            self.camera_locks = defaultdict(threading.Lock)
+            self.camera_running = {}
+            
+            # Shared resources with thread safety
+            self.latest_frame_lock = threading.Lock()
+            self.person_tracking_lock = threading.Lock()
+            
+            # Person tracking and detection (per camera)
+            self.active_persons = {}
+            self.person_detections = {}
+            self.pending_detections = {}
+            self.detection_lock = Lock()
+            self.person_lock = Lock()
+            self.policy_tabel={}
+            self.policy_tabel=self.db.camera_ppe_policy
+            self.camera_roi_map = self.db.camera_roi_map 
+            
+            # ID management (per camera)
+            self.track_id_mapping = defaultdict(dict)
+            self.custom_id_counter = defaultdict(int)
+            self.track_history = defaultdict(dict)
+            
+            # Performance settings
+            width=int(self.cfg.get("PERFORMANCE.target_width","640"))
+            height=int(self.cfg.get("PERFORMANCE.target_height","480"))
+            self.target_size = (width, height)
+            self.min_box_size = int(self.cfg.get("PERFORMANCE.min_box_size","40"))
+            self.min_person_area = int(self.cfg.get("PERFORMANCE.min_person_area","200"))
+            
             # Frame processing optimization
-            self.frame_counter = 0
-            self.last_detections = []
+            self.frame_counter = defaultdict(int)
+            self.detection_interval = int(self.cfg.get("PERFORMANCE.detection_interval","200"))
+           
+            self.colour_helmet_not_Allowed = [c.lower() for c in self.db.helemt_color_not_allowed]
+
+            self.last_status = {}                      # person_id -> status_signature
+            self.same_status_count = defaultdict(int) # person_id -> frame count
+
+            self.MIN_STABLE_FRAMES = 5   # or 6
+            self.post_stable_count = {}
+
             
-            # Batch processing for database operations
-            self.db_batch = []
-            self.db_batch_size = 5
-            self.last_db_flush = time.time()
-            self.db_lock = Lock()
+            self.vc = VideoCreator(self.db, self.frame_lock)
+            self.vc.start()
             
-            # Smart detection intervals based on tracking confidence
-            self.detection_intervals = {}  # track_id -> next_detection_time
-            self.high_conf_interval = 0.5   # High confidence tracks: detect every 0.5s
-            self.low_conf_interval = 0.2    # Low confidence tracks: detect every 0.2s
+            # Detection processing with thread pool for parallel PPE detection
+            self.detection_queue = queue.Queue(maxsize=self.maxsize)
+            self.detection_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=int(self.cfg.get("DETECTION.detection_workers","4")),
+                thread_name_prefix="PPE-Detection"
+            )
             
-            # FPS tracking
-            self.fps_counter = 0
-            self.fps_start_time = time.time()
-            self.fps_history = []
+            # Start database insertion thread
+            insert_db_thread = threading.Thread(target=self._save_to_database, daemon=True)
+            insert_db_thread.start()
+            insert_video_store_thread = threading.Thread(target=self.save_frame_and_detections, daemon=True)
+            insert_video_store_thread.start()
+            start_daemon_thread(self.cfg.get("RECORDING.recording_temp_dir", "N/A"),self.cfg.get("RECORDING.recording_video_dir", "N/A"),int(self.cfg.get("RECORDING.recording_max_frames_per_pid", "30")),int(self.cfg.get("RECORDING.recording_fps", "5")))
+
             
-            # Video end detection
-            self.consecutive_empty_frames = 0
-            self.max_empty_frames = 30
             
-            # Detection visualization settings
+            # Colors for visualization
             self.colors = {
+                'person': (255, 255, 0),
+                'head': (0, 255, 255),
                 'helmet': (0, 255, 0),
                 'vest': (255, 0, 255),
-                'head': (0, 0, 255),
-                'shoes': (255, 165, 0),
-                'person': (255, 255, 0),
-                'full_body': (0, 255, 255),
-                'partial_body': (128, 128, 128)
+                'safe': (0, 255, 0),
+                'unsafe': (0, 0, 255),
+                'tracking': (255, 165, 0),
+                '0':(0,0,100),
+                '1':(0,0,100),
+                '2':(0,0,100),
+                '3':(0,0,150),
+                '4':(0,0,250),
+                '5':(0,0,255)
             }
             
-            # Track inserted person IDs with expiry to avoid duplicates
-            self.inserted_person_ids = {}  # person_id -> timestamp
-            self.insertion_cooldown = 5.0  # 5 seconds cooldown
+            # Latest processed frames
+            self.latest_frames = {}
+            self.max_bbox_history =int(self.cfg.get("DETECTION.max_bbox_history","5"))
+            self.max_latest_frames = int(self.cfg.get("DETECTION.max_latest_frames","8"))
             
-            print("[INFO] Optimized FrameProcessor initialized successfully")
+            # Memory management
+            self.memory_cleanup_counter = defaultdict(int)
+            
+            # Start detection worker threads (multiple workers for parallel processing)
+            self._start_detection_workers(num_workers=3)
             
         except Exception as e:
-            print(f"[ERROR] Initialization failed: {e}")
+            self.logger.exception(f"[ERROR] Initialization failed: {e}")
             raise
+    
 
-    def _load_and_optimize_models(self):
-        """Load and optimize all models for better performance"""
+#_______________________________________________________________start_detection_workers_____________________________________________________________________________
+
+    def _start_detection_workers(self, num_workers=3):
+        """Start multiple background threads for PPE detection processing"""
         try:
-            # print("[INFO] Loading and optimizing models...")
-            
-            # Load models
-            self.detection_model = YOLO("resource/helmet_vest.pt")
-            self.model_shoes = YOLO("resource/model_shoes.pt")
-            self.pose_model = YOLO('resource/yolov8n-pose.pt')
-            self.tracking_model = YOLO("resource/yolov8n.pt")
-            
-            if torch.cuda.is_available():
-                # print("[INFO] Applying CUDA optimizations...")
-                
-                models = [self.detection_model, self.tracking_model, self.pose_model, self.model_shoes]
-                
-                for model in models:
-                    model.to('cuda')
-                    # Enable model optimizations
-                    try:
-                        model.fuse()  # Fuse conv and bn layers for speed
-                    except Exception as e:
-                        print(f"[WARNING] Model fusion failed: {e}")
-                    
-                    # Use half precision for inference speed
-                    try:
-                        model.half()
-                    except Exception as e:
-                        print(f"[WARNING] Half precision conversion failed: {e}")
-                
-                # Warm up models with dummy data
-                dummy_img = np.zeros((640, 640, 3), dtype=np.uint8)
-                for model in models:
-                    try:
-                        with torch.no_grad():
-                            _ = model(dummy_img, verbose=False, imgsz=320)
-                    except:
-                        pass
-                        
-                print("[INFO] Models optimized and warmed up")
-                
+            self.detection_workers = []
+            for i in range(num_workers):
+                worker_thread = threading.Thread(
+                    target=self._detection_worker,
+                    daemon=True,
+                    name=f"Detection-Worker-{i}"
+                )
+                worker_thread.start()
+                self.detection_workers.append(worker_thread)
         except Exception as e:
-            print(f"[ERROR] Model loading failed: {e}")
-            raise
+            self.logger.exception(f"[ERROR] Failed to start detection workers: {e}")
+
+
+
+
+#_______________________________________________________________is_policy_violation_________________________________________________________________________________________
+    
+    def is_policy_violation(self, camera_id, helmet, vest, shoes):
+        if camera_id not in self.policy_tabel:
+          return False
+
+        policy = self.policy_tabel[camera_id]
+
+        # ---------- Normalize helmet ----------
+        if isinstance(helmet, tuple):
+            helmet = helmet[0]
+        helmet_ok = str(helmet).strip().lower() in ("yes", "1", "true", "y")
+
+        # ---------- Normalize vest ----------
+        if isinstance(vest, tuple):
+            vest = vest[0]
+        vest_ok = str(vest).strip().lower() in ("yes", "1", "true", "y")
+
+        # ---------- Normalize shoes ----------
+        if isinstance(shoes, tuple):
+            shoes = shoes[0]
+        shoes_ok = str(shoes).strip().lower() in ("yes", "1", "true", "y")
+
+        # ---------- Policy logic ----------
+        # If policy says "no helmet" and helmet is NOT present → violation
+        if policy.get("no helmet") is True and not helmet_ok:
+            return True
+
+        if policy.get("no vest") is True and not vest_ok:
+            return True
+
+        if policy.get("no shoes") is True and not shoes_ok:
+            return True
+
+        return False
+    def _status_signature(self, result):
+        return (
+            result.get("helmet"),
+            result.get("vest"),
+            result.get("shoes"),
+            result.get("helmet_color"),
+            result.get("needs_warning")
+        )
+    
+
+
+# __________________________________________________________________________detection_worker_______________________________________________________________________________________
+   
+    def _detection_worker(self):
+        """Background worker for processing PPE detections"""
+        while self.running:
+           
+            frame_detections = []
+            
+            
+            try:
+                try:
+                    detection_data = self.detection_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                
+                if detection_data is None:
+                    break
+               
+                
+                person_id, frame, bbox, cam_id, conf = detection_data
+                x1, y1, x2, y2 = bbox
+
+                frame_detections.append([x1, y1, x2, y2, person_id])
+                
+             
+               
+        
+                detection_result = self._perform_ppe_detection(frame, person_id, bbox, cam_id,conf)
+                
+                
+                if detection_result:
+                    self.person_detections[person_id] = detection_result
+                    
+
+                    current_status = self._status_signature(detection_result)
+                    last_status = self.last_status.get(person_id)
+
+                #         # First time seeing this person
+                    if last_status is None:
+                            self.last_status[person_id] = current_status
+                            self.same_status_count[person_id] = 1
+                            self.event_triggered[person_id] = False
+                            continue
+
+                        # Same status as previous frame
+                    if current_status == last_status:
+                        self.same_status_count[person_id] = min(self.same_status_count[person_id]+1 , 10 )
+                        last_status = None
+                        if self.same_status_count[person_id] >=10:
+                            try:
+                                if person_id in self.last_inserted_status:
+                                    last_inserted_status = self.last_inserted_status[person_id][-1] if self.last_inserted_status[person_id] else None
+                                    if last_inserted_status != tuple(current_status[:3]):
+                                        try:
+                                            event_id_str = f"{person_id}"
+
+                                            self.event_queue.put((frame, person_id, cam_id, detection_result, bbox,event_id_str),block=False )
+                                            self.last_inserted_status[person_id].append(
+                                                tuple(current_status[:3])
+                                            )
+
+                                        except queue.Full:
+                                            pass   
+                                else:
+                                    try:
+                                            event_id_str = f"{person_id}"
+                                            self.event_queue.put((frame, person_id, cam_id, detection_result, bbox,event_id_str),block=False )
+                                            last_status = self.last_inserted_status[person_id][-1] if self.last_inserted_status[person_id] else None
+
+                                            if last_status != tuple(current_status[:3]):
+                                                self.last_inserted_status[person_id].append(
+                                                    tuple(current_status[:3])
+                                                )
+                                    except queue.Full:
+                                        pass   
+
+                            except Exception as e:
+                                print(e,"___detection worke")
+                        
+                    else:
+                        self.last_status[person_id] = current_status
+                        self.same_status_count[person_id] = 1
+                        self.event_triggered[person_id] = False
+                        continue
+            except Exception as e:
+                self.logger.exception(f"[ERROR] Detection worker error: {e}")
+                time.sleep(0.1)
+
 
   
-   
-    def detect_helmet_vest_head(self, frame, person_id, bbox):
-        """Optimized detection with smart caching"""
-        try:
-            current_time = time.time()
-            
-            # Check cache with TTL
-            cache_key = f"{person_id}_{current_time // self.cache_duration}"
-            if (cache_key in self.detection_cache and 
-                cache_key in self.cache_ttl and 
-                current_time - self.cache_ttl[cache_key] < self.cache_duration):
-                return self.detection_cache[cache_key]
 
+
+    #______________________________________________________________________________perform_ppe_detection__________________________________________________________
+
+    def _perform_ppe_detection(self, frame, person_id, bbox, cam_id, conf):
+
+        """Perform PPE detection on person crop, respecting camera PPE policy and optional PPE requirements."""
+       
+        try:
             x1, y1, x2, y2 = bbox
-            
-            # Validate bbox
             if x1 >= x2 or y1 >= y2 or x1 < 0 or y1 < 0:
                 return None
 
-            # Optimized cropping with minimal padding
-            padding = 10  # Reduced from 15
+            policy = self.policy_tabel.get(cam_id, {})  # {'no helmet':1,'no vest':0}
+        
+
             frame_h, frame_w = frame.shape[:2]
-            
+            # padding = int(self.cfg.get("PPE_DETECTION.padding", 30))
+            padding=0
+
             x1_crop = max(0, x1 - padding)
             y1_crop = max(0, y1 - padding)
             x2_crop = min(frame_w, x2 + padding)
             y2_crop = min(frame_h, y2 + padding)
 
-            person_crop = frame[y1_crop:y2_crop, x1_crop:x2_crop]
+            person_crop = frame[y1_crop:y2_crop, x1_crop:x2_crop].copy()
+            
+            
             
             if person_crop.size == 0:
                 return None
+            detection = self.person_detections.get(person_id)
+            
+            if detection:
+                frame_gaph_needed = 30
+                # last_detection_time = detection["detected_time"]
+                current_frame_count = self.active_persons[person_id]["detection_count"]
 
-            # Optimized resize
-            original_height, original_width = person_crop.shape[:2]
-            if max(original_height, original_width) > 416:
-                scale = 416 / max(original_width, original_height)
-                new_width = int(original_width * scale)
-                new_height = int(original_height * scale)
-                person_crop = cv2.resize(person_crop, (new_width, new_height), 
-                                       interpolation=cv2.INTER_LINEAR)
+                # print(self.id_wise_frame_count[person_id],"__________________count of ides frame wisw",person_id)
+                # if self.active_persons[person_id]:
+                    # print(self.active_persons[person_id]["detection_count"],"id :",person_id)
 
-            # Single model inference with optimizations
+                # if time.time()- last_detection_time < time_gaph_needed or self.same_status_count[person_id] >=  10:
+                #     return None
+                if person_id not in self.id_wise_frame_count:
+                    self.id_wise_frame_count[person_id]=1
+                else:
+                    self.id_wise_frame_count[person_id]+=1
+                if self.same_status_count[person_id] >=  10  and current_frame_count % frame_gaph_needed == 0:
+                    
+                    return None
+                # print("time diffence ",time.time()- last_detection_time)
+                # print(datetime.now(),"_____________")
+              
             with torch.no_grad():
-                # First pass: original image for vest detection
-                results = self.detection_model(
+                results = self.head_helmet_model(
                     person_crop,
-                    conf=0.1,  # Keep original threshold
+                    conf=float(self.cfg.get("PPE_DETECTION.conf_threshold", 0.1)),
+                    iou=float(self.cfg.get("PPE_DETECTION.iou_threshold", 0.4)),
                     verbose=False,
-                    imgsz=320,  # Reduced from 416 for speed
+                    imgsz=int(self.cfg.get("PPE_DETECTION.img_size", "416")),
                     half=True if self.device == 'cuda' else False
                 )
 
-                vest_detected = False
                 helmet_detected = False
-                vest_bbox = None
-                helmet_bbox = None
+                vest_detected = False
+                head_detected = False
+                helmet_color = "Unknown"
+                detection_boxes = []
 
-                # Process results
-                if results and results[0].boxes:
-                    for box in results[0].boxes:
-                        box_cls = int(box.cls[0].item())
-                        conf = float(box.conf[0])
-                        
-                        if box_cls == 1 and conf > 0.2:  # Reflective-Jacket
-                            vest_detected = True
-                            box_coords = box.xyxy[0].cpu().numpy().astype(int)
-                            scale_x = (x2_crop - x1_crop) / person_crop.shape[1]
-                            scale_y = (y2_crop - y1_crop) / person_crop.shape[0]
-                            vest_bbox = [
-                                int(x1_crop + box_coords[0] * scale_x),
-                                int(y1_crop + box_coords[1] * scale_y),
-                                int(x1_crop + box_coords[2] * scale_x),
-                                int(y1_crop + box_coords[3] * scale_y)
-                            ]
-                        elif box_cls == 0 and conf > 0.4:  # Safety-Helmet
-                            helmet_detected = True
-                            box_coords = box.xyxy[0].cpu().numpy().astype(int)
-                            scale_x = (x2_crop - x1_crop) / person_crop.shape[1]
-                            scale_y = (y2_crop - y1_crop) / person_crop.shape[0]
-                            helmet_bbox = [
-                                int(x1_crop + box_coords[0] * scale_x),
-                                int(y1_crop + box_coords[1] * scale_y),
-                                int(x1_crop + box_coords[2] * scale_x),
-                                int(y1_crop + box_coords[3] * scale_y)
-                            ]
+                helmet_conf = float(self.cfg.get("PPE_DETECTION.helmet_conf", 0.6))
+                vest_conf = float(self.cfg.get("PPE_DETECTION.vest_conf", 0.1))
+                head_conf = float(self.cfg.get("PPE_DETECTION.head_conf", 0.2))
+                 
 
-                # If helmet not detected in color, try grayscale
-                if not helmet_detected:
-                    gray_frame = cv2.cvtColor(person_crop, cv2.COLOR_BGR2GRAY)
-                    person_crop_gray = cv2.cvtColor(gray_frame, cv2.COLOR_GRAY2BGR)
-                    
-                    results_gray = self.detection_model(
-                        person_crop_gray,
-                        conf=0.1,
-                        verbose=False,
-                        imgsz=320,
-                        half=True if self.device == 'cuda' else False
-                    )
+                helmet_boxes = []
+                head_boxes = []
 
-                    if results_gray and results_gray[0].boxes:
-                        for box in results_gray[0].boxes:
-                            box_cls = int(box.cls[0].item())
-                            conf = float(box.conf[0])
+                if results and results[0].boxes is not None:
+                    boxes = results[0].boxes
+                    coords = boxes.xyxy.cpu().numpy()
+                    confs = boxes.conf.cpu().numpy()
+                    clss = boxes.cls.cpu().numpy().astype(int)
+
+                    # -------------------------------------------------------
+                    # CLASSIFICATION: Collect helmet boxes + head boxes
+                    # -------------------------------------------------------
+
+                    for i, cls_id in enumerate(clss):
+                        conf = confs[i]
+                        box_coords = coords[i].astype(int)
+
+                        bx1, by1, bx2, by2 = box_coords
+
+                        # Helmet Box (class = 0)
+                        if cls_id == 0 and conf > helmet_conf:
+                            helmet_color = self._extract_helmet_color(person_crop, box_coords)
+                            helmet_detected=True
+                            if helmet_color=='Red' or helmet_color=='Blue' or helmet_color=='Black' or helmet_color=='Unknown':
+                                helmet_detected = False
+                            helmet_boxes.append((box_coords, conf))
                             
-                            if box_cls == 0 and conf > 0.6:  # Safety-Helmet
-                                helmet_detected = True
-                                box_coords = box.xyxy[0].cpu().numpy().astype(int)
-                                scale_x = (x2_crop - x1_crop) / person_crop_gray.shape[1]
-                                scale_y = (y2_crop - y1_crop) / person_crop_gray.shape[0]
-                                helmet_bbox = [
-                                    int(x1_crop + box_coords[0] * scale_x),
-                                    int(y1_crop + box_coords[1] * scale_y),
-                                    int(x1_crop + box_coords[2] * scale_x),
-                                    int(y1_crop + box_coords[3] * scale_y)
-                                ]
-                                break
 
-            # Determine status
-            if helmet_detected and vest_detected:
-                safety_status = "helmet_and_vest"
-            elif helmet_detected:
-                safety_status = "helmet_only"
-            elif vest_detected:
-                safety_status = "vest_only"
+                        # Vest Box (class = 1)
+                        elif cls_id == 1 and conf > vest_conf:
+                            if policy.get('no vest', 0) == 1:
+                                vest_detected = True
+
+                        # Head Box (class = 2)
+                        elif cls_id == 2 and conf > head_conf:
+                         
+                            head_boxes.append((box_coords, conf))
+                            head_detected = True
+
+                # -------------------------------------------------------
+                # MATCH HELMET TO HEAD ✔️
+                # -------------------------------------------------------
+                correct_helmet_box = None
+
+                if head_boxes and helmet_boxes:
+                    hx1, hy1, hx2, hy2 = head_boxes[0][0]
+                    head_center = ((hx1 + hx2) // 2, (hy1 + hy2) // 2)
+
+                    min_distance = float("inf")
+
+                    for hb, hconf in helmet_boxes:
+                        bx1, by1, bx2, by2 = hb
+                        helmet_center = ((bx1 + bx2) // 2, (by1 + by2) // 2)
+
+                        distance = ((helmet_center[0] - head_center[0]) ** 2 +
+                                    (helmet_center[1] - head_center[1]) ** 2) ** 0.5
+
+                        # Helmet must be above or touching the head
+                        if by2 <= hy2 + 25:  # small tolerance
+                            if distance < min_distance:
+                                min_distance = distance
+                                correct_helmet_box = hb
+
+                    # Assign final helmet
+                    if correct_helmet_box is not None and policy.get('no helmet', 0) == 1:
+                        helmet_detected = True
+                        helmet_color = self._extract_helmet_color(person_crop, correct_helmet_box)
+                        if helmet_color=='Red' or helmet_color=='Blue' or helmet_color=='Black' or helmet_color=='Unkown':
+                            helmet_detected = False
+
+
+                        # Debug rectangle (optional)
+                        cx1, cy1, cx2, cy2 = correct_helmet_box
+                       
+                        
+
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+      
+            helmet_required = policy.get('no helmet', 0) == 1
+            vest_required = policy.get('no vest', 0) == 1
+
+            needs_warning = False
+            safety_status = "Safe"
+
+            if not helmet_required and not vest_required:
+                safety_status = "Safe (No PPE Required)"
             else:
-                safety_status = "no_protection"
+                if helmet_required and vest_required:
+                    if helmet_detected and vest_detected:
+                        safety_status = "Safe"
+                    elif helmet_detected and not vest_detected:
+                        safety_status = "Only Helmet"
+                        needs_warning = True
+                    elif not helmet_detected and vest_detected:
+                        safety_status = "Only Vest Detected"
+                        needs_warning = True
+                    else:
+                        safety_status = "No Protection"
+                        needs_warning = True
 
-            result = {
-                'vest': {'detected': vest_detected, 'bbox': vest_bbox},
-                'helmet': {'detected': helmet_detected, 'bbox': helmet_bbox},
-                'status': safety_status
+                elif helmet_required and not vest_required:
+                    if helmet_detected:
+                        safety_status = "Helmet Detected"
+                    else:
+                        safety_status = "No Helmet"
+                        needs_warning = True
+
+                elif vest_required and not helmet_required:
+                    if vest_detected:
+                        safety_status = "Vest Detected"
+                    else:
+                        safety_status = "No Vest"
+                        needs_warning = True
+                        
+            detection_result = {
+                'helmet': helmet_detected,
+                'vest': vest_detected,
+                'head': head_detected,
+                'helmet_color': helmet_color,
+                'safety_status': safety_status,
+                'needs_warning': needs_warning,
+                'detection_boxes': detection_boxes,
+                'detected_time': time.time(),
+                'person_id': person_id,
+                'confidence_scores': {
+                    'helmet': max([confs[i] for i in range(len(clss)) if clss[i] == 0], default=0.0),
+                    'vest': max([confs[i] for i in range(len(clss)) if clss[i] == 1], default=0.0),
+                    'head': max([confs[i] for i in range(len(clss)) if clss[i] == 2], default=0.0)
+                }
             }
-            
-            # Cache result with TTL
-            self.detection_cache[cache_key] = result
-            self.cache_ttl[cache_key] = current_time
-            
-            return result
+
+            return detection_result
 
         except Exception as e:
-            print(f"[ERROR] detect_helmet_vest_head: {e}")
+            self.logger.exception(f"[ERROR] PPE detection failed: {e}")
+            return None
+    def cleanup_person(self, person_id):
+        self.last_status.pop(person_id, None)
+        self.same_status_count.pop(person_id, None)
+
+
+
+
+
+
+    def _crop_to_absolute_coords(self, box_coords, x1_crop, y1_crop, crop_shape):
+        """Convert crop coordinates to absolute frame coordinates"""
+        try:
+            abs_bbox = [
+                int(x1_crop + box_coords[0]),
+                int(y1_crop + box_coords[1]),
+                int(x1_crop + box_coords[2]),
+                int(y1_crop + box_coords[3])
+            ]
+            return abs_bbox
+        except:
+            return [0, 0, 0, 0]
+
+    def _extract_helmet_color(self, helmet_crop, box_coords):
+        try:
+            i=0
+            x1, y1, x2, y2 = map(int, box_coords)
+            cropped = helmet_crop[y1:y2, x1:x2]
+            i=+1
+
+            if cropped.size == 0:
+                return None
+
+            hsv = cv2.cvtColor(cropped, cv2.COLOR_BGR2HSV)
+
+            color_ranges = {
+                'Red': [(np.array([0, 120, 70]), np.array([10, 255, 255])),
+                        (np.array([170, 120, 70]), np.array([180, 255, 255]))],
+                'Yellow': [(np.array([20, 100, 100]), np.array([30, 255, 255])),
+                          (np.array([10, 100, 20]), np.array([25, 255, 255]))],
+                'Blue': [(np.array([100, 150, 0]), np.array([140, 255, 255]))],
+                'Green': [(np.array([40, 70, 70]), np.array([80, 255, 255]))],
+                'White': [(np.array([0, 0, 200]), np.array([180, 30, 255]))],
+                'Black': [(np.array([0, 0, 0]), np.array([180, 255, 50]))]
+            }
+
+            color_counts = {}
+            for color, ranges in color_ranges.items():
+                mask_total = None
+                for lower, upper in ranges:
+                    mask = cv2.inRange(hsv, lower, upper)
+                    if mask_total is None:
+                        mask_total = mask
+                    else:
+                        mask_total = cv2.bitwise_or(mask_total, mask)
+                color_counts[color] = cv2.countNonZero(mask_total)
+
+            dominant_color = max(color_counts, key=color_counts.get)
+       
+            return dominant_color
+
+        except Exception as e:
+            self.logger.exception(f"Error in _extract_helmet_color: {e}")
             return None
 
-    def detect_shoes_optimized(self, frame, person_bbox):
-        """Optimized shoes detection within person region"""
-        # print("Optimized shoes detection within person region")
-        try:
-            
-            x1, y1, x2, y2 = person_bbox
-            height, width, _ = frame.shape
-
-            # Extend detection area below person bbox
-            if height > y2 + 30:  # Reduced from 50
-                y2 = y2 + 30
-
-            # Validate bbox
-            if x1 >= x2 or y1 >= y2 or x1 < 0 or y1 < 0:
-                return "false", None
-
-            # Define shoe region (lower 30% of the extended bbox)
-            shoe_region_start = int(y1 + (y2 - y1) * 0.7)
-            shoe_region = frame[shoe_region_start:y2, x1:x2]
-
-            if shoe_region.size == 0:
-                return "false", None
-
-            # Optimized shoes detection
-            with torch.no_grad():
-                shoes_results = self.model_shoes(
-                    shoe_region, 
-                    conf=0.1, 
-                    verbose=False,
-                    imgsz=320,  # Reduced from default for speed
-                    half=True if self.device == 'cuda' else False
-                )
-
-            shoes_detected = "false"
-            shoe_bbox = None
-
-            if shoes_results and shoes_results[0].boxes:
-                for box in shoes_results[0].boxes:
-                    conf = float(box.conf[0])
-                    cls = int(box.cls[0])
-
-                    if cls < len(self.model_shoes.names):
-                        label = self.model_shoes.names[cls].lower()
-
-                        if label == "safety_shoe" and conf > 0.3:
-                            # print("✅ Shoes detected!")
-                            shoes_detected = "shoes"
-                            box_coords = box.xyxy[0].cpu().numpy().astype(int)
-                            shoe_bbox = [
-                                x1 + box_coords[0],
-                                shoe_region_start + box_coords[1],
-                                x1 + box_coords[2],
-                                shoe_region_start + box_coords[3]
-                            ]
-                            return shoes_detected, shoe_bbox
-
-            return shoes_detected, shoe_bbox
-
-        except Exception as e:
-            print(f"[ERROR] detect_shoes_optimized: {e}")
-            return "false", None
-
-    def should_run_detection(self, person_id, track_confidence):
-        """Smart detection scheduling based on tracking confidence"""
-        current_time = time.time()
-        
-        # Determine detection interval based on confidence
-        if track_confidence > 0.7:
-            interval = self.high_conf_interval
+    def _determine_safety_status(self, helmet, vest, head, helmet_color):
+        """Determine overall safety status"""
+        if helmet and vest:
+            return "fully_protected"
+        elif helmet and not vest :
+            return "helmet_only"
+        elif not helmet and vest:
+            return "vest_only"
+        elif head and not helmet and not vest:
+            return "no_protection"
         else:
-            interval = self.low_conf_interval
-            
-        # Check if it's time for detection
-        if person_id not in self.detection_intervals:
-            self.detection_intervals[person_id] = current_time
-            return True
-            
-        if current_time - self.detection_intervals[person_id] >= interval:
-            self.detection_intervals[person_id] = current_time
-            return True
-            
-        return False
-
-    def _flush_db_batch(self):
-        """Flush database batch operations"""
-        try:
-            if not self.db_batch:
-                return
-                
-            for entry in self.db_batch:
-                self.db.insert_event(
-                    entry['cam_id'],
-                    entry['image'],
-                    entry['helmet'],
-                    entry['vest'],
-                    entry['shoes']
-                )
-            
-            # print(f"[DB] Flushed {len(self.db_batch)} entries")
-            self.db_batch.clear()
-            self.last_db_flush = time.time()
-            
-        except Exception as e:
-            print(f"[ERROR] _flush_db_batch: {e}")
-
-    def detection_process(self):
-        """
-        Optimized detection process:
-        - Runs in a separate thread
-        - Processes frames from frame_queue_to_store_detection
-        - Deletes frames that are already processed & inserted into DB
-        - Handles helmet, vest, shoes detection with caching
-        """
-        while self.frame_queue_to_store_detection:
-            try:
-                # Get next frame for detection
-                item = self.frame_queue_to_store_detection.get(timeout=0.1)
-                frame, x1, x2, y1, y2, person_id, cam_id = item
-
-                start_time = time.time()
-                with self.detection_thread_lock:
-                    self.active_detection_threads += 1
-
-                # Get person crop for detection
-                y1_crop = max(0, y1 )
-                y2_crop = min(frame.shape[0], y2 )
-                person_cropped_image = frame[y1_crop:y2_crop, x1:x2]
-
-                if person_cropped_image.size == 0:
-                    self.frame_queue_to_store_detection.task_done()
-                    continue
-
-                # Detect helmet & vest
-                safety_detection = self.detect_helmet_vest_head(frame, person_id, (x1, y1, x2, y2))
-                vest_detected = safety_detection and safety_detection['vest']['detected']
-                helmet_detected = safety_detection and safety_detection['helmet']['detected']
-
-                # Detect shoes
-                shoes_detected, shoe_bbox = self.detect_shoes_optimized(frame, (x1, y1, x2, y2))
-
-                # Prepare DB insertion if needed
-                needs_warning = not helmet_detected or not vest_detected or shoes_detected == "None"
-                current_time = time.time()
-                can_insert = True
-                if person_id in self.inserted_person_ids:
-                    if current_time - self.inserted_person_ids[person_id] < self.insertion_cooldown:
-                        can_insert = False
-
-                if needs_warning and can_insert:
-                    try:
-                        # Cleanup old person IDs
-                        if len(self.inserted_person_ids) > 100:
-                            old_entries = [pid for pid, ts in self.inserted_person_ids.items() if current_time - ts > 30.0]
-                            for pid in old_entries:
-                                del self.inserted_person_ids[pid]
-
-                        # Resize & encode image for DB
-                        person_cropped_image = cv2.resize(person_cropped_image, (300, 400))
-                        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 85]
-                        _, buffer = cv2.imencode('.jpg', person_cropped_image, encode_param)
-                        encoded_image = base64.b64encode(buffer).decode('utf-8')
-
-                        # DB entry
-                        db_entry = {
-                            'cam_id': cam_id,
-                            'image': encoded_image,
-                            'helmet': "Yes" if helmet_detected else "No",
-                            'vest': "Yes" if vest_detected else "No",
-                            'shoes': "Yes" if shoes_detected == "shoes" else "No",
-                            'person_id': person_id
-                        }
-
-                        # Batch DB insertion
-                        with self.db_lock:
-                            self.db_batch.append(db_entry)
-                            if len(self.db_batch) >= self.db_batch_size or current_time - self.last_db_flush > 2.0:
-                                self._flush_db_batch()
-
-                        # Mark as inserted
-                        self.inserted_person_ids[person_id] = current_time
-
-                    except Exception as e:
-                        print(f"[ERROR] DB insertion failed for person {person_id}: {e}")
-
-                # Mark this frame as done in queue
-                self.frame_queue_to_store_detection.task_done()
-
-                # Optional: Remove already processed frames to keep queue smooth
-                with self.frame_queue_to_store_detection.mutex:
-                    if len(self.frame_queue_to_store_detection.queue) > 0:
-                        latest = self.frame_queue_to_store_detection.queue[-1]
-                        self.frame_queue_to_store_detection.queue.clear()
-                        self.frame_queue_to_store_detection.queue.append(latest)
-                # with self.frame_queue_to_store_detection.mutex:
-                #     self.frame_queue_to_store_detection.queue = [
-                #         f for f in self.frame_queue_to_store_detection.queue
-                #     ]
-
-                end_time = time.time()
-                # print(f"[DETECTION] Person {person_id} processed in {end_time - start_time:.3f}s")
-
-            except queue.Empty:
-                # No frames to process, just wait
-                time.sleep(0.01)
-                continue
-            except Exception as e:
-                print(f"[ERROR] detection_process: {e}")
-            finally:
-                with self.detection_thread_lock:
-                    self.active_detection_threads = max(0, self.active_detection_threads - 1)
-
+            return "unknown"
         
-    
 
-    def draw_detection_box(self, frame, bbox, label, color, confidence=None):
-        """Draw detection box with label"""
-        if bbox is None:
-            return
+#____________________________________________________________________check_noticitaction____________________________________________________________________________
+    def check_noticitaction(self,event_id_str,cam_id,camera_name,relative_image_path,helmet,vest,shoes,time,helmet_color,relative_video_path):
+        # if self.is_policy_violation(cam_id,helmet,vest,shoes):
+        self.db.insert_notification_if_allowed(event_id_str,cam_id,camera_name,relative_image_path,helmet,vest,shoes,time,helmet_color,relative_video_path)
             
+         
+        
+  
+
+
+#____________________________________________________________________save_to_database___________________________________________________________________________________
+    def _save_to_database(self):
+        """Thread that saves detection events (images + DB entries) with annotated helmet/vest status above the bounding box."""
         try:
-            x1, y1, x2, y2 = bbox
-            
-            # Validate coordinates
-            if x1 >= x2 or y1 >= y2:
-                return
-            
-            # Draw rectangle
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            
-            # Prepare label text
-            if confidence:
-                text = f"{label} ({confidence:.2f})"
-            else:
-                text = label
-                
-            # Draw label background
-            # (text_width, text_height), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-            # cv2.rectangle(frame, (x1, y1 - text_height - 5), (x1 + text_width, y1), color, -1)
-            
-            # # Draw label text
-            # cv2.putText(frame, text, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            
-        except Exception as e:
-            print(f"[ERROR] draw_detection_box: {e}")
+           
+            last_state = defaultdict(dict)
+            # frame_detections = []
 
-    def cleanup_cache(self, current_time):
-        """Optimized cache cleanup"""
-        try:
-            if len(self.detection_cache) > 200:  # Cleanup threshold
-                # Remove entries older than cache duration
-                current_slot = int(current_time // self.cache_duration)
-                expired_keys = []
-                
-                for key in list(self.detection_cache.keys()):
-                    if '_' in key:
-                        try:
-                            key_slot = int(float(key.split('_')[-1]))
-                            if current_slot - key_slot > 3:  # Keep recent cache
-                                expired_keys.append(key)
-                        except:
-                            expired_keys.append(key)
-                
-                for key in expired_keys:
-                    self.detection_cache.pop(key, None)
-                    self.cache_ttl.pop(key, None)
-                    
-        except Exception as e:
-            print(f"[ERROR] cleanup_cache: {e}")
+            # 🔹 Load config values once
+            target_kb = int(self.cfg.get("DB_SAVER.image_target_kb", 200))
+            min_quality = int(self.cfg.get("DB_SAVER.min_jpeg_quality", 30))
+            max_quality = int(self.cfg.get("DB_SAVER.max_jpeg_quality", 95))
+            queue_timeout = float(self.cfg.get("DB_SAVER.queue_timeout", 0.2))
+            # random_suffix_digits = int(self.cfg.get("DB_SAVER.random_suffix_digits", 3))
+            annotation_thickness = int(self.cfg.get("DB_SAVER.annotation_thickness", 4))
 
-    def get_sort_custom_id(self, sort_id):
-        """Get or create custom ID for SORT tracking ID"""
-        try:
-            if sort_id not in self.track_id_mapping:
-                self.track_id_mapping[sort_id] = self.custom_id_counter
-                self.custom_id_counter += 1
-                # print(f"[TRACK] New person assigned ID: {self.track_id_mapping[sort_id]}")
-            return self.track_id_mapping[sort_id]
-        except Exception as e:
-            print(f"[ERROR] get_sort_custom_id: {e}")
-            return sort_id
-
-    def update_track_history(self, track_id, bbox, confidence):
-        """Update track history for smoothing"""
-        try:
-            if track_id not in self.track_history:
-                self.track_history[track_id] = []
-            
-            self.track_history[track_id].append({
-                'bbox': bbox,
-                'confidence': confidence,
-                'timestamp': time.time()
-            })
-            
-            # Keep only recent history (reduced for memory efficiency)
-            if len(self.track_history[track_id]) > 8:
-                self.track_history[track_id].pop(0)
-                
-        except Exception as e:
-            print(f"[ERROR] update_track_history: {e}")
-
-    def smooth_bbox(self, track_id, current_bbox):
-        """Smooth bounding box using track history"""
-        try:
-            if track_id not in self.track_history or len(self.track_history[track_id]) < 2:
-                return current_bbox
-            
-            history = self.track_history[track_id]
-            recent_bboxes = [h['bbox'] for h in history[-3:]]  # Last 3 frames
-            
-            # Weighted moving average (more weight to recent frames)
-            weights = [0.5, 0.3, 0.2] if len(recent_bboxes) == 3 else [0.6, 0.4] if len(recent_bboxes) == 2 else [1.0]
-            
-            x1_avg = sum([bbox[0] * w for bbox, w in zip(recent_bboxes, weights)])
-            y1_avg = sum([bbox[1] * w for bbox, w in zip(recent_bboxes, weights)])
-            x2_avg = sum([bbox[2] * w for bbox, w in zip(recent_bboxes, weights)])
-            y2_avg = sum([bbox[3] * w for bbox, w in zip(recent_bboxes, weights)])
-            
-            return [int(x1_avg), int(y1_avg), int(x2_avg), int(y2_avg)]
-            
-        except Exception as e:
-            print(f"[ERROR] smooth_bbox: {e}")
-            return current_bbox
-
-    def cleanup_tracks(self):
-        """Clean up old tracks and mappings"""
-        try:
-            current_time = time.time()
-            
-            # Clean old track history (older than 5 seconds)
-            tracks_to_remove = []
-            for track_id, history in self.track_history.items():
-                if history and current_time - history[-1]['timestamp'] > 5.0:
-                    tracks_to_remove.append(track_id)
-             
-            for track_id in tracks_to_remove:
-                if track_id in self.track_history:
-                    del self.track_history[track_id]
-                if track_id in self.track_id_mapping:
-                    # print(f"[TRACK] Removed expired track ID: {self.track_id_mapping[track_id]}")
-                    del self.track_id_mapping[track_id]
-                    
-        except Exception as e:
-            print(f"[ERROR] cleanup_tracks: {e}")
-
-    def get_fps(self):
-        """Calculate FPS"""
-        try:
-            current_time = time.time()
-            self.fps_counter += 1
-            
-            if current_time - self.fps_start_time >= 1.0:
-                fps = self.fps_counter / (current_time - self.fps_start_time)
-                self.fps_history.append(fps)
-                if len(self.fps_history) > 10:
-                    self.fps_history.pop(0)
-                
-                self.fps_counter = 0
-                self.fps_start_time = current_time
-                return fps
-            
-            return sum(self.fps_history) / len(self.fps_history) if self.fps_history else 0
-            
-        except Exception as e:
-            print(f"[ERROR] get_fps: {e}")
-            return 0
-
-    def process(self):
-        """Optimized real-time processing loop"""
-        try:
-            # print("[INFO] Starting frame processing...")
-
-            # [UPDATED] Store last fully processed frame per camera
-            if not hasattr(self, 'latest_frames'):
-                self.latest_frames = {}  # key: cam_id, value: frame
-                self.latest_frame_lock = threading.Lock()
 
             while self.running:
+                processed = False
                 try:
-                    # [GET FRAME]
+                    item = self.event_queue.get(timeout=queue_timeout)
+                    processed = True
+
+                    if item is None:
+                        break
+
+                    # Unpack event data
+                    # frame, person_id, cam_id, detection_result, bbox
+                    
+                    
+                    frame, event_id, cam_id, detection_result, bbox,event_id_str = item
+                    prev_helmet = prev_vest = prev_shoes = None
                     try:
-                        cam_id, frame = self.frame_queue.get(timeout=0.0001)
-                        show_queue[cam_id] = queue.Queue(maxsize=100)
-                        self.consecutive_empty_frames = 0
+                        prev_helmet = self.event_id_records[event_id_str]["h"]
+                        prev_vest = self.event_id_records[event_id_str]["v"]
+                        prev_shoes = self.event_id_records[event_id_str]["s"]
+                    
+                    
+                        if prev_helmet ==  detection_result.get('helmet', False) and prev_shoes ==  detection_result.get('shoes', False) and prev_vest == detection_result.get('vest', False):
+                            continue
+                    except Exception:
+                        pass
+                    x1, y1, x2, y2 = bbox
+                   
+                    current_state = (
+                        detection_result.get('helmet', False),
+                        detection_result.get('vest', False),
+                        detection_result.get('shoes', False),
+                        detection_result.get('helmet_color', None)
+                    )
+                    # frame_detections.append([x1, y1, x2, y2, event_id])
+
+                    # Skip duplicate states for same event
+                    if (event_id in last_state[cam_id] and
+                            last_state[cam_id][event_id] == current_state):
+                        continue
+
+                    last_state[cam_id][event_id] = current_state
+
+                    # Fetch camera name
+                    camera_name = self.db.fetch_Camera_name_deatils(cam_id)
+                    
+                    annotated_frame = frame.copy()
+                    
+                    # Annotate frame
+                    annotated_frame = frame.copy()
+                    cv2.rectangle(annotated_frame, (int(x1), int(y1)), (int(x2), int(y2)),
+                                (0, 0, 255), annotation_thickness)
+
+                    # ✅ Add helmet and vest text ABOVE the bounding box
+                    helmet_text = f"Helmet: {'Yes' if detection_result.get('helmet') else 'No'}"
+                    helmet_present = detection_result.get('helmet', False)
+                    vest_text = f"Vest: {'Yes' if detection_result.get('vest') else 'No'}"
+
+                    # Background rectangle for text
+                    top_box_height = 60
+                    y_text_top = max(0, y1 - top_box_height - 5)
+                    # cv2.rectangle(annotated_frame, (x1, y_text_top),
+                    #             (x1 + 250, y1 - 5), bg_color, -1)
+                    
+                    for det_type, det_bbox, extra in detection_result.get('detection_boxes', []):
+                        dx1, dy1, dx2, dy2 = map(int, det_bbox)
+
+                        if det_type == 'helmet':
+                            color = (0, 255, 0)  # Green for helmet
+                            label = f"Helmet"
+                        elif det_type == 'head':
+                            color = (255, 255, 0)  # Yellow for head
+                            label = "Head"
+                        elif det_type == 'vest':
+                            color = (255, 0, 0)  # Blue for vest
+                            label = "Vest"
+                        else:
+                            continue
+
+                
+
+
+                
+                    # Compress image
+                    def compress_image_to_kb(image, target_kb, min_q, max_q):
+                        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), max_q]
+                        success, encoded_img = cv2.imencode(".jpg", image, encode_param)
+                        size_kb = len(encoded_img) / 1024
+
+                        while size_kb > target_kb and encode_param[1] > min_q:
+                            encode_param[1] -= 5
+                            success, encoded_img = cv2.imencode(".jpg", image, encode_param)
+                            size_kb = len(encoded_img) / 1024
+
+                        return encoded_img
+
+                    compressed_image = compress_image_to_kb(annotated_frame, target_kb, min_quality, max_quality)
+                    del annotated_frame
+
+                    base_folder = self.base_folder
+                    # If DB returned None or empty, assign a default folder
+                    if not base_folder:
+                        base_folder = os.path.join(os.getcwd(), "app_data", "images")
+
+                    # Create folder if it does not exist
+                    if not os.path.exists(base_folder):
+                        os.makedirs(base_folder, exist_ok=True)
+
+                    # Save final usable folder
+                    self.base_folder = base_folder
+                    today_folder = datetime.now().strftime("%d-%m-%Y")
+                    camera_folder = os.path.join(base_folder, today_folder, camera_name)
+                    os.makedirs(camera_folder, exist_ok=True)
+
+                    # filename = datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".jpg"
+                    filename = datetime.now().strftime("%d%m%Y_%H%M%S_%f") + ".jpg"
+                    videoname = f"{camera_name}_{event_id}.ts"
+
+                    image_path = os.path.join(camera_folder, filename)
+
+                    # Save compressed image
+                    with open(image_path, "wb") as f:
+                        f.write(compressed_image)
+
+                    relative_image_path = os.path.join(today_folder, camera_name, filename)
+                    relative_video_path=os.path.join(today_folder, camera_name, videoname)
+                    helmet_color = detection_result.get('helmet_color', None)
+                    if not helmet_present:
+                            helmet_color = None
+                    elif not helmet_color or str(helmet_color).strip().lower() == "unknown":
+                            helmet_color = None
+                    helmet="Yes" if detection_result.get('helmet') else "No",
+                    vest="Yes" if detection_result.get('vest') else "No",
+                    shoes="Yes" if detection_result.get('shoes', True) else "No",
+                    time= datetime.now()
+                    
+                   
+                    # Insert event into DB
+                    self.db.insert_event(
+                        track_id=event_id_str,
+                        camera_id=cam_id,
+                        camera_name=camera_name,
+                        Image_Path=relative_image_path,
+                        helmet="Yes" if detection_result.get('helmet') else "No",
+                        vest="Yes" if detection_result.get('vest') else "No",
+                        shoes="Yes" if detection_result.get('shoes', True) else "No",
+                        helmet_color= None,
+                        relative_video_path=relative_video_path,
+                        time=time
+
+                    
+                    )
+                    self.event_id_records[event_id_str]= {
+                        "h":True if helmet[0] == "Yes" else False,
+                        "v":True if vest[0] == "Yes" else False,
+                        "s":True if shoes[0] == "Yes" else False,
+                    }
+                    if len(self.event_id_records) > 50:
+                        self.event_id_records.pop(0)
+                 
+
+                    self.check_noticitaction(event_id_str,cam_id,camera_name,relative_image_path,helmet,vest,shoes,time,helmet_color,relative_video_path)
+                
+
+                    
+          
+
+                except queue.Empty:
+                    continue
+                except Exception as e:
+                    self.logger.exception(f"[ERROR] Database save failed: {e}")
+                finally:
+                    if processed:
+                        try:
+                            self.event_queue.task_done()
+                        except Exception:
+                            pass
+
+        except Exception as e:
+            self.logger.exception(f"[ERROR] DB saver thread crashed: {e}")
+        finally:
+            self.logger.exception("[DB-SAVER] Exiting DB saver thread")
+
+
+
+    
+
+    #_____________________________________________________________get_sort_custom_id______________________________________________________________________________
+
+
+     
+
+    def get_sort_custom_id(self, sort_id, cam_id):
+        """Get or create custom ID for SORT tracking per camera"""
+        try:
+            if sort_id not in self.track_id_mapping[cam_id]:
+                self.custom_id_counter[cam_id] += 1
+                self.track_id_mapping[cam_id][sort_id] = self.custom_id_counter[cam_id]
+            return self.track_id_mapping[cam_id][sort_id]
+        except Exception as e:
+            self.logger.exception(f"[ERROR] ID mapping failed: {e}")
+            return sort_id
+        
+
+
+
+    #_____________________________________________________________update_person_tracking_____________________________________________________________________________
+
+  
+    def update_person_tracking(self, person_id, bbox, confidence, timestamp):
+        """Update person tracking information and mark person as ACTIVE"""
+
+        try:
+            with self.person_lock:
+
+                # Person appears for the first time
+                if person_id not in self.active_persons:
+                    self.active_persons[person_id] = {
+                        'first_seen': timestamp,
+                        'last_seen': timestamp,
+                        'bbox_history': [bbox],
+                        'status': 'new',          # new → active → lost
+                        'is_active': True,
+                        'detection_count': 1,
+                        'confidence': confidence
+                    }
+
+                    pid_last_seen[person_id] = {
+                        'first_seen': timestamp,
+                        'last_seen': timestamp,
+                        'frame_count':1
+                    }
+
+                else:
+                    # Update existing person
+                    person_data = self.active_persons[person_id]
+
+                    person_data['last_seen'] = timestamp
+                    person_data['bbox_history'].append(bbox)
+                    person_data['detection_count'] += 1
+                    person_data['confidence'] = confidence
+                    person_data['is_active'] = True
+
+                    # Promote status
+                    if person_data['status'] == 'new' and person_data['detection_count'] >= 3:
+                        person_data['status'] = 'active'
+
+                    # Limit bbox history
+                    if len(person_data['bbox_history']) > self.max_bbox_history:
+                        person_data['bbox_history'].pop(0)
+
+                    pid_last_seen[person_id]['last_seen'] = timestamp
+                    pid_last_seen[person_id]['frame_count'] += 1
+                
+
+
+        except Exception as e:
+            self.logger.exception(f"[ERROR] Person tracking update failed: {e}")
+
+
+
+
+#____________________________________________________________________________________should_process_detection_____________________________________________________________
+
+
+    def should_process_detection(self, person_id,const=None):
+        try:
+            if not hasattr(self, "person_frame_count"):
+                self.person_frame_count = {}
+                const=False
+
+            self.person_frame_count[person_id] = self.person_frame_count.get(person_id, 0) + 1
+
+            if person_id in self.person_detections:
+                if self.person_frame_count[person_id] > 6:
+                    self.person_frame_count[person_id] = 0
+                    const=True
+                    return True,const
+                else:
+                    return False
+
+            with self.person_lock:
+                if person_id not in self.active_persons:
+                    return False,const
+
+                person_info = self.active_persons[person_id]
+                if person_info['detection_count'] >= 1:
+                    return True,const
+
+            return False,const
+
+        except Exception as e:
+            self.logger.exception(f"Error in should_process_detection: {e}")
+            return False
+
+
+
+
+#_______________________________________________________________________________draw_visualizations_____________________________________________________________
+
+
+    def draw_visualizations(self, frame, person_id, bbox, cam_id):
+        """Fast drawing of bounding box + status text"""
+        try:
+            x1, y1, x2, y2 = bbox
+
+            # ---------- FAST LOOKUP ----------
+            with self.detection_lock:
+                detection = self.person_detections.get(person_id)
+
+            # ---------- DEFAULT VALUES (NO DATA) ----------
+            main_color = self.colors['unsafe']
+            status_text = f" N/A"
+            # status_text=f" Only Vest Detcted "
+            safty_count=0
+
+            # ---------- ONLY IF DATA EXISTS ----------
+            if detection:
+                safety_status = detection.get("safety_status", "unknown")
+                needs_warning = detection.get("needs_warning", False)
+
+                if safety_status != "unknown":
+                    if needs_warning:
+                        main_color = self.colors['unsafe']
+                        vote = self.same_status_count[person_id]
+                        status_text = f"ID:{person_id} [{vote}  ]- {safety_status.replace('_', ' ').title()}"
+                        # status_text = f"{safety_status.replace('_', ' ').title()}"
+                        # status_text=f" Only Helmet"
+                        # status_text=f" Only Vest Detcted "
+
+                    else:
+                        
+                        main_color = self.colors['safe']
+                        # vote = self.same_status_count[person_id]
+                        # print(vote,status_text)
+                        # status_text=f" Only Vest Detcted "
+                        status_text = f"- SAF"
+          
+            
+            cv2.rectangle(frame, (x1, y1), (x2, y2), main_color, 2)
+
+            # ---------- DRAW LABEL ----------
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.6
+            thickness = 2
+            pad = 4
+
+            (tw, th), _ = cv2.getTextSize(status_text, font, font_scale, thickness)
+
+            y1_text = max(y1 - th - pad * 2, 0)
+
+            # Background
+            cv2.rectangle(
+                frame,
+                (x1, y1_text),
+                (x1 + tw + pad * 2, y1),
+                (255, 255, 255),
+                -1
+            )
+
+            # Border
+            cv2.rectangle(
+                frame,
+                (x1, y1_text),
+                (x1 + tw + pad * 2, y1),
+                main_color,
+                1
+            )
+
+            # Text
+            cv2.putText(
+                frame,
+                status_text,
+                (x1 + pad, y1 - pad),
+                font,
+                font_scale,
+                (0, 0, 0),
+                thickness,
+                cv2.LINE_AA
+            )
+
+        except Exception as e:
+            self.logger.exception(f"[ERROR] Visualization drawing failed: {e}")
+
+
+
+
+
+
+#___________________________________________________________________cleanup_old_persons________________________________________________________________
+
+    def cleanup_old_persons(self, current_time, cam_id):
+        """Clean up old person records for specific camera"""
+        try:
+            cleanup_threshold = int(self.cfg.get("PPE_DETECTION.cleanup_threshold","30"))
+            persons_to_remove = []
+            
+            with self.person_lock:
+                for person_id, person_info in self.active_persons.items():
+                    if person_id.startswith(f"{cam_id}_") and current_time - person_info['last_seen'] > cleanup_threshold:
+                        persons_to_remove.append(person_id)
+            
+            for person_id in persons_to_remove:
+                with self.person_lock:
+                    if person_id in self.active_persons:
+                        del self.active_persons[person_id]
+                
+                with self.detection_lock:
+                    if person_id in self.person_detections:
+                        del self.person_detections[person_id]
+                
+                sort_ids_to_remove = [k for k, v in self.track_id_mapping[cam_id].items() 
+                                     if f"{cam_id}_{v}" == person_id]
+                for sort_id in sort_ids_to_remove:
+                    del self.track_id_mapping[cam_id][sort_id]
+                        
+        except Exception as e:
+            self.logger.exception(f"[ERROR] Cleanup failed: {e}")
+
+
+
+
+    
+
+
+
+
+
+#_______________________________________________________________save_frame_and_detections________________________________________________________________________________________________________________________
+
+
+    def save_frame_and_detections(self):
+    
+        """Store frames and detections in memory (frame_list) instead of writing to disk."""
+        self.frame_list_lock = Lock()  # Thread safety
+
+        try:
+            while self.store_video:
+                try:
+                    # Expecting (frame, detections, person_id, cam_id)
+                    frame, detections, person_id, camera_name ,event_id= self.store_video.get(timeout=0.5)
+                    
+              
+
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+                    # --- Prepare detection data ---
+                    data = {
+                        
+                        "camera_id": camera_name,
+                        "timestamp": timestamp,
+                        "image": frame.copy(),   # store numpy frame
+                        "detections": [],
+                        "event_id":event_id,
+                        "person_id":person_id
+                    }
+
+                    for det in detections:
+                        # det = [x1, y1, x2, y2, conf, person_id]
+                        detection_result = None
+
+                        # with self.detection_lock:
+                        if person_id in self.person_detections:
+                            detection_result = self.person_detections[person_id]
+
+                        # Skip if no valid detection info
+                        if not detection_result or detection_result.get('safety_status') == "unknown":
+                            continue
+
+                        # Determine label text & color (not drawn yet)
+                        if detection_result.get('needs_warning'):
+                            main_color = self.colors['unsafe']
+                            status_text = f"ID:{person_id} - {detection_result.get('safety_status', 'Warning').replace('_', ' ').title()}"
+                        else:
+                            main_color = self.colors['safe']
+                            status_text = f"ID:{person_id} - SAFE"
+
+                     
+
+                        data["detections"].append({
+                            "person_id": det[-1],
+                            "bbox": [int(det[0]), int(det[1]), int(det[2]), int(det[3])],
+                            "confidence": status_text,
+                            "color": main_color
+                        })
+
+                    # --- Store in memory safely ---
+                    with self.frame_list_lock:
+                        frame_list.put(data,block=False)
+                    time.sleep(0.1)
+
+                except Exception as e:
+                    time.sleep(0.1)
+                    continue
+
+        except Exception as e:
+          self.logger.exception(e)
+
+
+
+
+
+
+    def save_frame_structured(self,frame, person_id, camera_name):
+        # Generate folder structure
+        date_folder = datetime.now().strftime("%Y-%m-%d")
+        
+        base_dir = f"saved_frames/camera_{camera_name}/person_{person_id}/{date_folder}"
+        os.makedirs(base_dir, exist_ok=True)
+
+        # File name with timestamp
+        timestamp = int(time.time() * 1000)
+        file_path = f"{base_dir}/{timestamp}.jpg"
+
+        # Save image
+        cv2.imwrite(file_path, frame)
+
+
+
+    #_______________________________________________________________________________draw_roi_on_frame_______________________________________________
+
+
+    def draw_roi_on_frame(self,frame, roi_points):
+
+        h, w = frame.shape[:2]
+
+        # Remove duplicate last point if same as first
+        if roi_points[0] == roi_points[-1]:
+            roi_points = roi_points[:-1]
+
+        # % → pixel conversion
+        pts = np.array(
+            [
+                [
+                    int(p["x"] * w / 100.0),
+                    int(p["y"] * h / 100.0)
+                ]
+                for p in roi_points
+            ],
+            dtype=np.int32
+        )
+        pts = pts.reshape((-1, 1, 2))
+        cv2.polylines(frame, [pts], isClosed=True, color=(0, 255,0), thickness=2)
+     
+
+
+  
+
+
+#_______________________________________________________________cleanup_inactive_tracks__________________________________________________________________
+
+    def cleanup_inactive_tracks(self, max_age=5):
+        inactive_ids = []
+        current_time = time.time()
+
+        for pid in self.active_persons:
+            last_seen = self.active_persons[pid]['last_seen']
+            if (current_time - last_seen) > max_age:
+                inactive_ids.append(pid)
+
+        for pid in inactive_ids:
+            
+            del self.active_persons[pid]
+            if len(inactive_ids_record)>50:
+                inactive_ids_record.pop()
+            inactive_ids_record.append(pid)
+        
+
+    
+#____________________________________________________________________________expand_head_to_person_______________________________________________________________
+
+    def _expand_head_to_person(self, frame, head_bbox):
+        try:
+            x1, y1, x2, y2 = head_bbox
+            # return [ x1, y1, x2, y2]
+            frame_h, frame_w = frame.shape[:2]
+            
+            head_width = x2 - x1
+            head_height = y2 - y1
+            
+            # Approximate person dimensions
+            person_width = int(head_width *2)#if u want to go for person  (head_width*2.5)
+            person_height = int(head_height*2)# if u want to go for person  (head_height*6)
+            
+            # Calculate person bbox
+            center_x = (x1 + x2) // 2
+            person_x1 = max(0, center_x - person_width // 2)
+            person_x2 = min(frame_w, center_x + person_width // 2)
+            person_y1 = max(0, y1 - head_height // 4)
+            person_y2 = min(frame_h, y1 + person_height)
+            
+            return [person_x1, person_y1, person_x2, person_y2]
+            
+        except:
+            return head_bbox
+
+
+    
+#_____________________________________________________________________________________add_frame_to_camera_queue___________________________________________________
+
+    def add_frame_to_camera_queue(self, cam_id, frame,count):
+        """Add frame to camera-specific queue and start processing thread if needed"""
+        if cam_id not in self.store_frame:
+            self.store_frame[cam_id] = queue.Queue(maxsize=1)
+            self.camera_running[cam_id] = True
+                 # Start dedicated processing thread for this camera
+            camera_thread = threading.Thread(
+                target=self.process_camera,
+                args=(cam_id,),
+                daemon=True,
+                name=f"Camera-{cam_id}-Thread"
+            )
+            self.camera_threads[cam_id] = camera_thread
+            camera_thread.start()
+        
+        cam_queue = self.store_frame[cam_id]
+        
+        # Drop old frames if queue is full to prevent lag
+        if cam_queue.full():
+            try:
+                old_frame = cam_queue.get_nowait()
+                del old_frame
+            except queue.Empty:
+                pass
+        
+        try:
+            cam_queue.put((frame,count), block=False)
+        except queue.Full:
+            pass
+
+
+
+
+#___________________________________________________________________________PROCESSS________________________________________________________________________________________
+
+    def process(self):
+        """Main processing loop - distributes frames to camera threads"""
+        try:
+            
+            while self.running:
+                try:
+                    try:
+                        cam_id, frame, count = self.frame_queue.get(timeout=0.01)
+                      
+                        if frame is None:
+                            break
+                     
+                       
+                        # Distribute frame to camera-specific queue
+                        self.add_frame_to_camera_queue(cam_id, frame,count)
+                        
+                        # Mark as processed
+                        try:
+                            self.frame_queue.task_done()
+                        except:
+                            pass
+                    
                     except queue.Empty:
-                        self.consecutive_empty_frames += 1
-                        if self.consecutive_empty_frames >= self.max_empty_frames:
-                            print("[INFO] No more frames - video ended")
                         continue
                     except Exception as e:
-                        print(f"[ERROR] Frame queue error: {e}")
+                        self.logger.exception(f"[ERROR] Frame distribution error: {e}")
+                        continue
+                
+                except KeyboardInterrupt:
+                    self.logger.exception("[INFO] Frame distribution interrupted by user")
+                    break
+                except Exception as e:
+                    self.logger.exception(f"[ERROR] Distribution loop error: {e}")
+                    time.sleep(0.001)
+        
+        except Exception as e:
+            self.logger.exception(f"[ERROR] Main processing loop crashed: {e}")
+        finally:
+            # Stop all camera threads
+            self.logger.info("[INFO] Stopping all camera processing threads...")
+            for cam_id in self.camera_running:
+                self.camera_running[cam_id] = False
+            
+            # Wait for threads to finish
+            for cam_id, thread in self.camera_threads.items():
+                thread.join(timeout=2.0)
+              
+            cv2.destroyAllWindows()
+
+
+
+
+    
+
+
+    #_______________________________________________________________________________process_camera__________________________________________________
+
+    def process_camera(self, cam_id):
+        """Dedicated processing loop for a specific camera with optimized performance"""
+        last_cleanup_time = time.time()
+        confidance=float(self.cfg.get("PROCESS_CAMERA.detection_conf", 0.1))
+        detction_ios=float(self.cfg.get("PROCESS_CAMERA.detection_iou", 0.3))
+        
+
+        try:
+            while self.running and self.camera_running.get(cam_id, True):
+                try:
+                    cam_queue = self.store_frame.get(cam_id)
+
+                    if cam_queue is None:
                         break
+
+                    try:
+                        frame_timeout = float(self.cfg.get("PROCESS_CAMERA.frame_timeout", 0.05))
+                        
+                        frame, count = cam_queue.get(timeout=frame_timeout)
+                        
+                       
+                        
+                    except queue.Empty:
+                        continue
 
                     if frame is None:
                         break
 
-                    current_time = time.time()
-                    self.frame_counter += 1
+                    current_time = int(time.time())
+                    display_frame = frame.copy()
+                    
+                    points = self.camera_roi_map.get(cam_id)
 
-                    show_frame = frame.copy()
+                    if points and len(points) >= 3:
+                        self.draw_roi_on_frame(display_frame, points)
+                        h, w = frame.shape[:2]
+                        roi_polygon = np.array(
+                            [(int(p["x"] * w / 100), int(p["y"] * h / 100)) for p in points],
+                            dtype=np.int32
+                        ).reshape((-1, 1, 2))
 
-                    # [UPDATED] Detection + Tracking
-                    try:
-                        results = self.tracking_model.predict(
-                            source=frame,
-                            conf=0.3,
-                            iou=0.7,
-                            classes=[0],
-                            verbose=False,
-                            imgsz=320
-                        )
-
-                        boxes = results[0].boxes
-                        detections = []
-
-                        if boxes is not None and boxes.xyxy is not None:
-                            coords = boxes.xyxy.cpu().numpy()
-                            confs = boxes.conf.cpu().numpy()
-                            clss = boxes.cls.cpu().numpy().astype(int)
-
-                            for i, cls_id in enumerate(clss):
-                                x1, y1, x2, y2 = coords[i]
-                                if (x2 - x1) > self.min_box_size and (y2 - y1) > self.min_box_size:
-                                    detections.append([x1, y1, x2, y2, confs[i]])
-
-                        if len(detections) > 0:
-                            detections_np = np.array(detections)
-                            tracks = self.sort_tracker.update(detections_np)
-                        else:
-                            tracks = self.sort_tracker.update(np.empty((0, 5)))
-
-                        for track in tracks:
-                            x1, y1, x2, y2, sort_id = map(int, track)
-
-                            person_id = self.get_sort_custom_id(sort_id)
-
-                            track_confidence = 0.2
-                            for det in detections:
-                                det_x1, det_y1, det_x2, det_y2, det_conf = det
-                                if (abs(det_x1 - x1) < 20 and abs(det_y1 - y1) < 20 and
-                                    abs(det_x2 - x2) < 20 and abs(det_y2 - y2) < 20):
-                                    track_confidence = det_conf
-                                    break
-
-                            self.update_track_history(sort_id, [x1, y1, x2, y2], track_confidence)
-                            smoothed_bbox = self.smooth_bbox(sort_id, [x1, y1, x2, y2])
-                            x1, y1, x2, y2 = smoothed_bbox
-
-                            frame_h, frame_w = frame.shape[:2]
-                            x1 = max(0, min(x1, frame_w - 1))
-                            y1 = max(0, min(y1, frame_h - 1))
-                            x2 = max(x1 + 1, min(x2, frame_w))
-                            y2 = max(y1 + 1, min(y2, frame_h))
-                            # y2 += 20
-                            # y1 -= 10
+                        camera_name = None
+                    
+                        try:
+                            with torch.no_grad():
+                                results = self.person_model.track(
+                                    source=frame,
+                                    conf=confidance,
+                                    iou=detction_ios,
+                                    verbose=False,
+                                    persist=True
+                                )
                             
-                            cv2.rectangle(show_frame, (x1, y1), (x2, y2), (0, 0, 255), 3)
-                            cv2.putText(show_frame, f"ID: {person_id}", (x1, y1 - 10),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 3)
-                            # with self.latest_frame_lock:
-                            #  self.latest_frames[cam_id] = show_frame
+                                frame_detections = []
 
-                            self.frame_queue_to_store_detection.put((frame, x1, x2, y1, y2, person_id, cam_id))
-                            
-                            # if (self.latest_frame_lock):
-                            #         frame_to_show = self.latest_frames.get(cam_id)
+                                if results and results[0].boxes is not None:
 
-                            # while frame_queue_to_show.full():
-                            #         try:
-                            #             frame_queue_to_show.get_nowait()  # Remove the oldest frame
-                            #         except queue.Empty:
-                            #             break  # 
+                                    for box in results[0].boxes:
+                                        cls_id = int(box.cls.item())
+                                        if cls_id != 0:   # Only person class
+                                            continue
+
+                                        x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                                        conf = float(box.conf.item())
+                                        track_id = int(box.id.item()) if box.id is not None else -1
+                                    
+                                        # track_id = self.prev_id + track_id
+                                        cx = (x1 + x2) // 2
+                                        cy = (y1 + y2) // 2
+
+                                        if roi_polygon is not None:
+                                            if cv2.pointPolygonTest(roi_polygon, (cx, cy), False) < 0:
+                                                continue   # 
+                                                                            
+                                    
+                                        temp_id = f"{cam_id}_{track_id}"
+                                        if temp_id in self.time_stamp_track_id_records:
+                                            person_id = self.time_stamp_track_id_records[temp_id]["actual_id"]
+                                            
+                                        else:
+                                            person_id = f"{temp_id}_{int(time.time())}"
+                                            self.time_stamp_track_id_records[temp_id] = {
+                                                        "temp_id": temp_id,
+                                                        "actual_id": person_id
+                                                    }
+                                        if len(self.time_stamp_track_id_records) > 50:
+                                            # self.time_stamp_track_id_records.pop(0)
+                                            self.time_stamp_track_id_records.pop(next(iter(self.time_stamp_track_id_records)))
+
+
+
+                                        # # Update tracking memory
+                                        self.update_person_tracking(person_id, [x1, y1, x2, y2], conf, current_time)
+                                        # person_id=f"{cam_id}_{track_id}_{pid_last_seen[Temp_person_id]['first_seen']}"
+
                                         
-                            
-                           
-                            
+                                        frame_detections.append([x1, y1, x2, y2, conf, person_id])
+                                        # if person_id not in self.id_wise_frame_count:
+                                        #     self.id_wise_frame_count[person_id]=1
+                                        # else:
+                                        #     self.id_wise_frame_count[person_id]+=1
+                                        
+                                        try:
+                                            self.detection_queue.put(
+                                                (person_id, frame.copy(), [x1, y1, x2, y2], cam_id, conf),
+                                                block=False
+                                            )
+                                        except queue.Full:
+                                            pass
+                                    
+                                        camera_name = self.db.fetch_Camera_name_deatils(cam_id)
+                                        event_id_str = f"{person_id}"
+                                        send_to_video = True
 
-                        
+                                        with self.person_video_lock:
+                                            if self.person_video_frame_count[person_id] >= self.MAX_VIDEO_FRAMES_PER_PERSON:
+                                                send_to_video = False
+                                            else:
+                                                self.person_video_frame_count[person_id] += 1
 
-                            # [SPAWN DETECTION THREAD IF NEEDED]
-                            # with self.detection_thread_lock:
-                            #     can_start_thread = self.active_detection_threads < self.max_detection_threads
+                                        if send_to_video and self.store_video is not None:
+                                            try:
+                                                self.store_video.put_nowait(
+                                                    (frame, frame_detections, person_id, camera_name, event_id_str)
+                                                )
+                                            except queue.Full:
+                                                pass
+                                            except Exception as e:
+                                                self.logger.exception(f"[STORE_VIDEO] Unexpected error: {e}")
 
-                            # if can_start_thread:
-                                # detection_thread = threading.Thread(
-                                #     target=self.detection_process,
-                                #     args=(frame, x1, x2, y1, y2, person_id, cam_id),
-                                #     daemon=True
-                                # )
-                                # detection_thread.start()
+                                        self.draw_visualizations(display_frame, person_id, [x1, y1, x2, y2], cam_id)
+                                    # cv2.imshow(f"{cam_id}", display_frame)
+                                    # cv2.waitKey(int(self.cfg.get("PROCESS_CAMERA.wait_key", 1)))   
+                                    post_buffer_frames.append({
+                                                                "camera": camera_name,
+                                                                "timestamp": time.time(),
+                                                                "frame": frame
+                                                            })
+                                    
 
-                    except Exception as e:
-                        print(f"[ERROR] SORT tracking error: {e}")
+                                    
 
-                    # [UPDATED] Update shared processed frame (thread-safe)
+                                  
+
+                                del results
+
+                        except Exception as e:
+                         self.logger.exception(e)
+    
+                       
+                    # -------------------------
+                    # Display
+                    # -------------------------
+                    if self.cfg.get("PROCESS_CAMERA.show_window", "True") == "True":
+                        prefix = self.cfg.get("PROCESS_CAMERA.display_window_prefix", "PPE Detection - Camera")
+                        if int(self.cfg.get("PROCESS_CAMERA.vieo_mode",0)):
+                            cv2.imshow(f"{prefix} {cam_id}", display_frame)
+                            cv2.waitKey(int(self.cfg.get("PROCESS_CAMERA.wait_key", 1)))
+
+                    # Save latest frame
                     with self.latest_frame_lock:
-                        self.latest_frames[cam_id] = show_frame
+                        self.latest_frames[cam_id] = display_frame.copy()
+                        if len(self.latest_frames) > self.max_latest_frames:
+                            del self.latest_frames[min(self.latest_frames.keys())]
 
-                    # [UPDATED] Display logic moved outside.
-                    try:
-                        with self.latest_frame_lock:
-                            frame_to_show = self.latest_frames.get(cam_id)
+                    # Cleanup
+                    if time.time() - last_cleanup_time > float(self.cfg.get("PROCESS_CAMERA.cleanup_interval", 15)):
+                        self.cleanup_old_persons(current_time, cam_id)
+                        last_cleanup_time = time.time()
 
-                        while frame_queue_to_show.full():
-                            try:
-                                frame_queue_to_show.get_nowait()  # Remove the oldest frame
-                            except queue.Empty:
-                                break  # Shouldn't happen, but just in case
-                        # if frame is not None:
-                        #  cv2.imshow(f"Camera {cam_id}", frame)
-
-                        # if cv2.waitKey(1) & 0xFF == ord('q'):
-                        #  break
-
-                        frame_queue_to_show.put((cam_id, frame_to_show), timeout=0.001)
-                        # self.frame_queue_to_store_detection.put((frame, x1, x2, y1, y2, person_id, cam_id))
-                    except queue.Full:
-                        pass
-
-                    self.cleanup_cache(current_time)
-
-                    try:
-                        self.frame_queue.task_done()
-                    except:
-                        pass
+                    self._memory_cleanup(cam_id)
+                    del display_frame
 
                 except KeyboardInterrupt:
-                    print("[INFO] Interrupted by user")
+                
+                    self.logger.exception(f"[INFO] Camera {cam_id} processing interrupted")
                     break
                 except Exception as e:
-                    
-                    print(f"[ERROR] Frame processing: {e}")
-                    time.sleep(0.01)
+                   
+                    time.sleep(0.1)
+                    self.logger.exception(f"[ERROR] Camera {cam_id} frame processing error: {e}")
+                self.cleanup_inactive_tracks()
+        finally:
+            self.logger.info(f"[INFO] Camera {cam_id} processing thread stopped")
+            cv2.destroyAllWindows()
+            
 
+
+    #__________________________________________________________________________________________________________________________memory_cleanup_____________________________________
+
+    def _memory_cleanup(self, cam_id):
+        """Perform periodic memory cleanup per camera"""
+        try:
+            self.memory_cleanup_counter[cam_id] += 1
+            
+            if self.memory_cleanup_counter[cam_id] % 100 == 0 and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            with self.latest_frame_lock:
+                if len(self.latest_frames) > self.max_latest_frames:
+                    oldest_key = min(self.latest_frames.keys()) if self.latest_frames else None
+                    if oldest_key is not None:
+                        del self.latest_frames[oldest_key]
+            
+            if self.memory_cleanup_counter[cam_id] % 100 == 0:
+                gc.collect()
+                
         except Exception as e:
-            print(f"[ERROR] Processing loop crashed: {e}")
+            self.logger.exception(f"[ERROR] Memory cleanup failed: {e}")
+
+
+
+
+
+   
 
     def stop(self):
-        """Stop processing and cleanup"""
-        # print("[INFO] Stopping frame processor...")
+        """Stop all processing"""
         self.running = False
-
-    
+        
+        # Stop all camera threads
+        for cam_id in list(self.camera_running.keys()):
+            self.camera_running[cam_id] = False
+        
+        # Wait for all camera threads
+        for thread in self.camera_threads.values():
+            thread.join(timeout=2.0)
+        
+        # Signal detection workers to stop
+        for _ in range(len(self.detection_workers) if hasattr(self, 'detection_workers') else 0):
+            try:
+                self.detection_queue.put(None, timeout=0.5)
+            except:
+                pass
+        
+        # Wait for detection workers to finish
+        if hasattr(self, 'detection_workers'):
+            for worker in self.detection_workers:
+                if worker.is_alive():
+                    worker.join(timeout=2.0)
+        
+        # Shutdown detection exec
+        if hasattr(self, 'detection_executor'):
+            self.detection_executor.shutdown(wait=True, cancel_futures=True)
+        
+       
+        # Clear all data structures
+        with self.person_lock:
+            self.active_persons.clear()
+        
+        with self.detection_lock:
+            self.person_detections.clear()
+        
+        with self.latest_frame_lock:
+            self.latest_frames.clear()
+        
+        # Clear tracking mappings
+        self.track_id_mapping.clear()
+        self.track_history.clear()
+        self.pending_detections.clear()
+        
+        # Clear camera trackers
+        with self.tracker_lock:
+            self.camera_trackers.clear()
+        
+        # Clear CUDA cache
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        # Force garbage collection
+        gc.collect()
+        
         cv2.destroyAllWindows()
 
     def close(self):
         """Close all resources"""
-        self.running = False
-
-        
+        # self.vc.stop()
+        self.stop()
         try:
-            self.stop()
             if hasattr(self, 'db'):
                 self.db.close()
         except Exception as e:
-            print(f"[ERROR] close: {e}")
+            self.logger.exception(f"[ERROR] Resource cleanup failed: {e}")
 
 
-def create_frame_processor(frame_queue,  person_crop_queue):
-    """Create the optimized frame processor"""
-    return FrameProcessor(frame_queue,  person_crop_queue)
